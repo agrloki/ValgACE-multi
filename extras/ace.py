@@ -455,7 +455,13 @@ class ACEDevice:
         """Запросить статус устройства."""
         def status_callback(response):
             if 'result' in response:
-                self._info.update(response['result'])
+                result = response['result']
+                # DEBUG: Log if slots is not a list
+                if 'slots' in result and not isinstance(result['slots'], list):
+                    self.logger.warning(f"Device {self.device_id}: status_callback received slots as {type(result['slots']).__name__}, value={result['slots']}")
+                    # Prevent invalid slots data from overwriting valid data
+                    del result['slots']
+                self._info.update(result)
         if self.reactor.monotonic() - self._last_status_request > (0.2 if self._park_in_progress else 1.0):
             try:
                 self.send_request({
@@ -477,6 +483,12 @@ class ACEDevice:
                     self.logger.error(f"Device {self.device_id} callback error: {str(e)}")
         if 'result' in response and isinstance(response['result'], dict):
             result = response['result']
+            
+            # DEBUG: Log if slots is not a list
+            if 'slots' in result and not isinstance(result['slots'], list):
+                self.logger.warning(f"Device {self.device_id}: Received slots as {type(result['slots']).__name__}, value={result['slots']}")
+                # Prevent invalid slots data from overwriting valid data
+                del result['slots']
             
             # Нормализация данных о сушилке
             if 'dryer_status' in result and isinstance(result['dryer_status'], dict):
@@ -692,6 +704,11 @@ class ValgAce:
             self.variables = {}
             self.logger.warning("save_variables module not found, variables will not persist across restarts")
         
+        # Защита от переопределения self.devices из save_variables
+        # Если в сохраненных переменных есть 'devices', не позволяем ему переопределить self.devices
+        if 'devices' in self.variables:
+            self.logger.warning("Warning: 'devices' variable found in save_variables, but it will not override self.devices")
+        
         # === CURRENT TOOL TRACKING ===
         # Глобальный индекс текущего инструмента (-1 = не выбран)
         self._current_global_slot = -1
@@ -713,6 +730,10 @@ class ValgAce:
         Построить отображение глобальных слотов на устройства.
         Глобальный слот = device_id * 4 + local_slot
         """
+        if not isinstance(self.devices, dict):
+            self.logger.error(f"_build_slot_mapping: self.devices is {type(self.devices).__name__} instead of dict")
+            self.devices = {}
+        
         self._slot_to_device: Dict[int, Tuple[int, int]] = {}
         self._device_slot_to_global: Dict[Tuple[int, int], int] = {}
         
@@ -792,6 +813,9 @@ class ValgAce:
     
     def is_single_device_mode(self) -> bool:
         """Проверить, работает ли модуль в режиме одного устройства."""
+        if not isinstance(self.devices, dict):
+            self.logger.error(f"is_single_device_mode: self.devices is {type(self.devices).__name__} instead of dict")
+            return False
         return len(self.devices) == 1
     
     def _register_handlers(self):
@@ -832,6 +856,10 @@ class ValgAce:
     
     def _connect_check(self, eventtime):
         """Периодическая проверка подключения устройств."""
+        if not isinstance(self.devices, dict):
+            self.logger.error(f"_connect_check: self.devices is {type(self.devices).__name__} instead of dict")
+            return eventtime + 1.0
+        
         for device_id, device in self.devices.items():
             if not device.is_connected() and not device._manually_disconnected:
                 device.connect()
@@ -839,12 +867,24 @@ class ValgAce:
     
     def _handle_ready(self):
         """Обработчик события готовности принтера."""
+        # Проверяем, что self.devices является словарем, а не int
+        if not isinstance(self.devices, dict):
+            self.logger.error(f"_handle_ready: self.devices is {type(self.devices).__name__} instead of dict. Resetting to empty dict.")
+            self.devices = {}
+        
         self.toolhead = self.printer.lookup_object('toolhead')
         if self.toolhead is None:
             raise self.printer.config_error("Toolhead not found in ValgAce module")
+        
+        # Перестраиваем маппинг слотов
+        self._build_slot_mapping()
     
     def _handle_disconnect(self):
         """Обработчик события отключения принтера."""
+        if not isinstance(self.devices, dict):
+            self.logger.error(f"_handle_disconnect: self.devices is {type(self.devices).__name__} instead of dict")
+            return
+        
         for device in self.devices.values():
             device._manually_disconnected = False
             device.disconnect()
@@ -867,8 +907,16 @@ class ValgAce:
         Поддерживает как одиночное устройство (обратная совместимость),
         так и массив устройств.
         """
+        # Проверяем, что self.devices является словарем, а не int
+        if not isinstance(self.devices, dict):
+            self.logger.error(f"Critical error: self.devices is {type(self.devices).__name__} instead of dict. Resetting to empty dict.")
+            self.devices = {}
+        
         # Single device mode (backward compatible)
         if self.is_single_device_mode():
+            if 0 not in self.devices:
+                self.logger.error("No device at index 0 in single device mode")
+                return {}
             device = self.devices[0]
             return self._get_single_device_status(device, eventtime)
         
@@ -912,6 +960,14 @@ class ValgAce:
         else:
             dryer_normalized = {}
         
+        # DEBUG: Log slots type and value for diagnosis
+        slots_raw = info.get('slots', [])
+        if not isinstance(slots_raw, list):
+            self.logger.warning(f"Device {device.device_id}: slots is not a list! Type={type(slots_raw).__name__}, Value={slots_raw}")
+        
+        # Ensure slots is always a list
+        slots = slots_raw if isinstance(slots_raw, list) else []
+        
         return {
             'status': info.get('status', 'unknown'),
             'model': info.get('model', ''),
@@ -925,7 +981,7 @@ class ValgAce:
             'feed_assist_slot': device._feed_assist_index,
             'dryer': dryer_normalized,
             'dryer_status': dryer_normalized,
-            'slots': info.get('slots', []),
+            'slots': slots,
             'connected': device._connected,
             'device_id': device.device_id
         }
@@ -951,6 +1007,12 @@ class ValgAce:
         output.append(f"Total slots: {self._total_slots}")
         output.append(f"Mode: {'single' if self.is_single_device_mode() else 'multi_device'}")
         output.append("")
+        
+        if not isinstance(self.devices, dict):
+            self.logger.error(f"cmd_ACE_LIST_DEVICES: self.devices is {type(self.devices).__name__} instead of dict")
+            output.append("Error: Internal configuration error - devices not properly initialized")
+            gcmd.respond_info("\n".join(output))
+            return
         
         for device_id, device in sorted(self.devices.items()):
             status = "connected" if device._connected else "disconnected"
